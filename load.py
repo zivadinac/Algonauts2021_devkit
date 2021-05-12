@@ -1,7 +1,10 @@
+import glob
 import os
 import numpy as np
 from utils.helper import make_path, load_dict
 import cv2
+import torch
+from torch.nn.utils.rnn import pad_sequence
 
 def load_fmri(fmri_dir, subject, ROI):
     """This function loads fMRI data into a numpy array for to a given ROI.
@@ -94,7 +97,6 @@ def load_activations(activations_dir, layer_name):
     test_activations : np.array
         matrix of dimensions #test_vids x #pca_components
         containing activations of test videos
-
     """
 
     train_file = os.path.join(activations_dir,"train_" + layer_name + ".npy")
@@ -107,6 +109,82 @@ def load_activations(activations_dir, layer_name):
 
     return train_activations, test_activations
 
-vp = "data/AlgonautsVideos268_All_30fpsmax/0001_0-0-1-6-7-2-8-0-17500167280.mp4"
+def __pad_sequence(sequences, from_beginning=True, pad_value=0):
+    """ Pad sequences with `pad_value` to the same length, which is chosen to be max length of all sequences. Padding is done `from_beginning` or not.
 
-v = load_video(vp)
+    Parameters
+    ----------
+    sequence : iterable
+        Tensors representing sequences, first dimension is seq len, remaining dimensions and dtype must be the same for all elemenets.
+    from_beginning : bool
+        Wherher to add additional elements to the beginning or end of a sequence.
+    pad_value : 
+        A value used for padding.
+
+    Returns
+    -------
+    padded_sequences : torch.tensor
+        Tensor with padded sequences of shape (len(sequences), max_seq_len, ...)
+    """
+    if from_beginning is False:
+        return pad_sequence(sequence, batch_first=True, padding_value=pad_value)
+
+    if any([s.shape[1:] != sequences[0].shape[1:] for s in sequences]):
+        raise ValueError("All sequences must have the same shape (except the first dimensions, 0).")
+
+    if any([s.dtype != sequences[0].dtype for s in sequences]):
+        raise ValueError("All sequences must have the same dtype.")
+
+    seq_len = max([s.shape[0] for s in sequences])
+    seq_shape = tuple(sequences[0].shape[1:])
+    seq_dtype = sequences[0].dtype
+    padded_sequences = torch.ones(len(sequences), seq_len, *seq_shape, dtype=seq_dtype) * pad_value
+
+    for i,s in enumerate(sequences):
+        padded_sequences[i, -s.shape[0]:, ...] = s
+
+    return padded_sequences
+
+def load_sequential_data(features_dir, layer, fmri_dir, subject, ROI):
+    """ Load sequence data for using with a N-CDE model.
+        Also, adds time dimension to sequences.
+
+    Parameters
+    ----------
+    features_dir : str
+        path to features
+    subject : int or str
+        layer number if int, 'layer_#num' if str
+    fmri_dir : str
+        path to fMRI data
+    subject : int or str
+        subject number if int, 'sub#num' if str
+    ROI : str
+        name of ROI.
+
+    Returns
+    -------
+    X : np.array
+        a tensor of sequence of activations of shape (#videos, #sequence_len, #features)
+    Y : np.array
+        a tensor of fMRI responses of shape (#videos, #voxels)
+    X_test : np.array
+        a tensor of test activations of shape (#videos, #sequence_len, #features)
+    """
+    layer_str = f"layer_{layer}" if type(layer) == int else layer
+    activation_files = glob.glob(features_dir + "/*" + layer_str + ".npy")
+    activation_files.sort()
+
+    def __load_to_torch(file_path):
+        x = torch.from_numpy(np.concatenate(np.load(file_path)))
+        x = x.flatten(1) # have to flatten because of adding time channel (singel number)
+        return torch.cat([x, torch.arange(1, x.shape[0]+1).unsqueeze(1)], dim=1) 
+
+    X = __pad_sequence([__load_to_torch(acf) for acf in activation_files])
+    X_train = X[0:1000]
+    Y_train = torch.from_numpy(load_fmri(fmri_dir, subject, ROI).mean(axis=1).astype(np.float32))
+    X_test = X[1000:]
+
+    return X_train, Y_train, X_test
+
+X_train, Y_train, X_test = load_sequential_data("./data/alexnet_frames/", "layer_5", "./data/participants_data_v2021/", 1, "V1")
